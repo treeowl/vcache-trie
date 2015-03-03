@@ -7,8 +7,8 @@ Description:
   and structure sharing. Effective use of VCache requires useful data
   structures be modeled above it. The trie is useful for modeling key
   value databases or abstract virtual filesystems, where keys have 
-  large shared prefixes and elements with a common prefix are more 
-  likely to be updated together. 
+  shared prefixes or elements with a common prefix are likely to be
+  updated together.
   .
   Currently, the implementation is specialized to a bytestring trie,
   and follows the interface of the bytestring-trie package.
@@ -34,6 +34,7 @@ Library
   default-language: Haskell2010
   Build-Depends: base (>= 4.6 && < 5)
     , bytestring
+    , array
     , vcache (>= 0.2.2)
 
   Exposed-Modules:
