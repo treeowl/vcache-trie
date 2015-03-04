@@ -2,7 +2,19 @@
 -- | A compact bytestring trie implemented above VCache.
 module Data.VCache.Trie
     ( Trie
-    
+    , trie_space
+    , empty, singleton
+    , null, size
+    , addPrefix
+
+    , unionWith
+
+    , toList
+    , toListBy
+    , foldr, foldr', foldrWithKey, foldrWithKey'
+    , foldl, foldl', foldlWithKey, foldlWithKey'
+
+    , map, mapWithKey
     ) where
 
 import Control.Applicative
@@ -11,6 +23,7 @@ import Data.Bits
 import Data.Word
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Internal as BSI
 import Data.Typeable
 import qualified Data.Array.IArray as A
@@ -39,19 +52,160 @@ import Database.VCache
 -- This encoding doesn't make the invariants of a trie especially
 -- easy to reason about. Fortunately, tries are relatively easy to
 -- reason about even with a simplistic encoding.
+--
 
-data Trie a = Trie
+data Node a = Node
     { trie_branch :: {-# UNPACK #-} !(Children a) -- arity 256; one byte from prefix
     , trie_prefix :: {-# UNPACK #-} !ByteString   -- compact extended prefix
     , trie_accept :: !(Maybe a)                   -- value at specific node
     } deriving (Eq, Typeable)
+-- Invariant for nodes: either we branch or we accept.
 
 type Children a = A.Array Word8 (Child a)
 type Child a = Maybe (VRef (Trie a))
 
+-- | The Trie data structure. 
+--
+-- The element type for the trie will be stored directly within each
+-- node. So, if it's very large and shouldn't be parsed during lookup,
+-- developers should use a VRefs in the data type. For small data, it
+-- is likely better for performance to pack the data into each node.
+-- 
+-- A trie with content is serialized as a pointer to the root node.
+--
+data Trie a = Trie 
+    { trie_root  :: !(Child a)
+    , trie_space :: !VSpace
+    } deriving (Eq, Typeable) 
+
+instance (VCacheable a) => VCacheable (Node a) where
+    get = Node <$> getChildren <*> get <*> get
+    put (Node c p v) = putChildren c >> put p >> put v
 instance (VCacheable a) => VCacheable (Trie a) where
-    get = Trie <$> getChildren <*> get <*> get
-    put (Trie c p v) = putChildren c >> put p >> put v
+    get = Trie <$> get
+    put = put . trie_root
+
+instance (Show a) => Show (Trie a) where
+    showsPrec p t = showParen (p > 0) $
+        "Data.VCache.Trie.fromList " ++ shows (toList t)
+
+-- | Construct Trie with no elements.
+empty :: VSpace -> Trie a
+empty = Trie Nothing
+{-# INLINE empty #-}
+
+emptyChildren :: Children a
+emptyChildren = A.accumArray const Nothing (minBound, maxBound) [] 
+
+-- | Construct Trie with one element.
+singleton :: (VCacheable a) => VSpace -> a -> Trie a
+singleton a !vc = Trie (Just pRoot) vc where
+    pRoot = vref vc node
+    node = Node emptyChildren B.empty (Just a)
+
+-- | O(1), test whether trie is empty.
+null :: Trie a -> Bool
+null t = isNothing . trie_root
+{-# INLINE null #-}
+
+-- | O(n), compute size of the trie.
+size :: Trie a -> Int
+size t = childSize . trie_root
+{-# INLINE size #-}
+
+childSize :: Child a -> Int
+childSize = maybe 0 (nodeSize . deref')
+
+nodeSize :: Node a -> Int
+nodeSize (Node c _ v) =
+    let csz = L.foldl' (+) 0 $ fmap childSize (A.elems c) in
+    let vsz = if isNothing v then 0 else 1 in
+    vsz + csz
+
+-- | Obtain a list of key, value pairs from a trie.
+toList :: Trie a -> [(ByteString, a)]
+toList = toListBy (,)
+{-# INLINE toList #-}
+
+elems :: Trie a -> [a]
+elems = toListBy (\ _ v -> v)
+{-# INLINE elems #-}
+
+keys :: Trie a -> [ByteString]
+keys = toListBy (\ k _ -> k)
+{-# INLINE keys #-}
+
+toListBy :: (ByteString -> a -> b) -> Trie a -> [b]
+toListBy fn = foldrWithKey (\ k v bs -> fn k v : bs) []
+{-# INLINE toListBy #-}
+
+-- | add a common prefix to all existing keys in a Trie. This may be
+-- used to model mounting into a directory structure, for example.
+addPrefix :: (VCacheable a) => ByteString -> Trie a -> Trie a
+addPrefix _ t@(Trie Nothing _) = t
+addPrefix p (Trie (Just pRoot) vc) =
+    let root = deref' pRoot in
+    let p' = p `B.append` (trie_prefix root) in
+    let root' = root { trie_prefix = p' } in
+    let pRoot' = vref vc root' in
+    Trie (Just $! pRoot') vc
+
+-- should probably have some variations to:
+--   extract a whole sub-trie by prefix
+--   delete a whole sub-trie by prefix
+
+
+foldrWithKey, foldrWithKey' :: (ByteString -> a -> b -> b) -> b -> Trie a -> b
+foldlWithKey, foldlWithKey' :: (b -> ByteString -> a -> b) -> b -> Trie a -> b
+foldrWithKey fn b0  = _foldrWithKey  fn b0 . trie_root
+foldrWithKey' fn b0 = _foldrWithKey' fn b0 . trie_root
+foldlWithKey fn b0  = _foldlWithKey  fn b0 . trie_root
+foldlWithKey' fn b0 = _foldlWithKey' fn b0 . trie_root
+{-# INLINE foldrWithKey #-}
+{-# INLINE foldrWithKey' #-}
+{-# INLINE foldlWithKey #-}
+{-# INLINE foldlWithKey' #-}
+
+foldr, foldr' :: (a -> b -> b) -> b -> Trie a -> b
+foldl, foldl' :: (b -> a -> b) -> b -> Trie a -> b
+foldr  = foldrWithKey  . const
+foldr' = foldrWithKey' . const
+foldl  = foldlWithKey  . const
+foldl' = foldlWithKey' . const
+{-# INLINE foldr #-}
+{-# INLINE foldr' #-}
+{-# INLINE foldl #-}
+{-# INLINE foldl' #-}
+
+
+_foldrWithKey, _foldrWithKey' :: (ByteString -> a -> b -> b) -> b -> Child a -> b
+_foldlWithKey, _foldlWithKey' :: (b -> ByteString -> a -> b) -> b -> Child a -> b
+
+
+
+fold
+
+
+
+
+
+
+
+{-
+unionWith :: (a ->
+filterWithKey :: (ByteString -> a -> Bool) -> Trie a -> Trie a
+
+
+map :: (VCacheable b) => (a -> b) -> Trie a -> Trie b
+mapWithKey :: (VCacheable b) => (ByteString -> a -> b) -> Trie a -> Trie b
+
+
+
+filterMap :: (VCacheable b) =
+-}
+
+
+
 
 getChildren :: (VCacheable a) => VGet (Children a)
 getChildren = A.listArray (minBound, maxBound) <$> getChild256
