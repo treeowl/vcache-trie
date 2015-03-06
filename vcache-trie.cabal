@@ -34,13 +34,17 @@ Library
   default-language: Haskell2010
   Build-Depends: base (>= 4.6 && < 5)
     , bytestring
+    , bytestring-builder
     , array
-    , vcache (>= 0.2.2)
+    , vcache (>= 0.2.3)
 
   Exposed-Modules:
     Data.VCache.Trie
 
   Other-Modules:
+
+    Strict
+    Ident
    
   ghc-options: -Wall -auto-all
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DeriveDataTypeable #-}
+{-# LANGUAGE BangPatterns, PatternGuards, DeriveDataTypeable #-}
 -- | A compact bytestring trie implemented above VCache.
 module Data.VCache.Trie
     ( Trie
@@ -6,33 +6,40 @@ module Data.VCache.Trie
     , empty, singleton
     , null, size
     , addPrefix
+    , lookup, lookup', lookupc
+    , lookupPrefix
 
-    , unionWith
+    , toList, toListBy, elems, keys
+    , foldr, foldr', foldrM, foldrWithKey, foldrWithKey', foldrWithKeyM
+    , foldl, foldl', foldlM, foldlWithKey, foldlWithKey', foldlWithKeyM
 
-    , toList
-    , toListBy
-    , foldr, foldr', foldrWithKey, foldrWithKey'
-    , foldl, foldl', foldlWithKey, foldlWithKey'
+    -- , map, mapM, mapWithKey, mapWithKeyM 
 
-    , map, mapWithKey
     ) where
 
-import Control.Applicative
+import Prelude hiding (null, lookup, foldr, foldl)
+import Control.Applicative hiding (empty)
 import Control.Monad
+import Control.Exception (assert)
 import Data.Bits
 import Data.Word
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as LB
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Internal as BSI
 import Data.Typeable
 import qualified Data.Array.IArray as A
 import qualified Data.List as L
 import Data.Maybe
+import Data.Monoid
 
 import Foreign.ForeignPtr
 import Foreign.Ptr
 import Foreign.Storable
+
+import Strict
+import Ident
 
 import Database.VCache
 
@@ -62,7 +69,7 @@ data Node a = Node
 -- Invariant for nodes: either we branch or we accept.
 
 type Children a = A.Array Word8 (Child a)
-type Child a = Maybe (VRef (Trie a))
+type Child a = Maybe (VRef (Node a))
 
 -- | The Trie data structure. 
 --
@@ -82,12 +89,13 @@ instance (VCacheable a) => VCacheable (Node a) where
     get = Node <$> getChildren <*> get <*> get
     put (Node c p v) = putChildren c >> put p >> put v
 instance (VCacheable a) => VCacheable (Trie a) where
-    get = Trie <$> get
+    get = Trie <$> get <*> getVSpace
     put = put . trie_root
 
 instance (Show a) => Show (Trie a) where
     showsPrec p t = showParen (p > 0) $
-        "Data.VCache.Trie.fromList " ++ shows (toList t)
+        showString "Data.VCache.Trie.fromList " .
+        shows (toList t)
 
 -- | Construct Trie with no elements.
 empty :: VSpace -> Trie a
@@ -99,92 +107,190 @@ emptyChildren = A.accumArray const Nothing (minBound, maxBound) []
 
 -- | Construct Trie with one element.
 singleton :: (VCacheable a) => VSpace -> a -> Trie a
-singleton a !vc = Trie (Just pRoot) vc where
+singleton vc a = Trie (Just pRoot) vc where
     pRoot = vref vc node
     node = Node emptyChildren B.empty (Just a)
 
 -- | O(1), test whether trie is empty.
 null :: Trie a -> Bool
-null t = isNothing . trie_root
+null = isNothing . trie_root
 {-# INLINE null #-}
 
--- | O(n), compute size of the trie.
+-- | O(n). Compute size of the trie.
 size :: Trie a -> Int
-size t = childSize . trie_root
+size = foldr' (const (1 +)) 0 
 {-# INLINE size #-}
 
-childSize :: Child a -> Int
-childSize = maybe 0 (nodeSize . deref')
-
-nodeSize :: Node a -> Int
-nodeSize (Node c _ v) =
-    let csz = L.foldl' (+) 0 $ fmap childSize (A.elems c) in
-    let vsz = if isNothing v then 0 else 1 in
-    vsz + csz
-
--- | Obtain a list of key, value pairs from a trie.
+-- | O(n). Obtain a list of (key,val) pairs, sorted by key.
 toList :: Trie a -> [(ByteString, a)]
 toList = toListBy (,)
 {-# INLINE toList #-}
 
+-- | O(n). Obtain list of elements in the trie.
 elems :: Trie a -> [a]
-elems = toListBy (\ _ v -> v)
+elems = toListBy (flip const)
 {-# INLINE elems #-}
 
+-- | O(n). Obtain a sorted list of of keys.
 keys :: Trie a -> [ByteString]
-keys = toListBy (\ k _ -> k)
+keys = toListBy const
 {-# INLINE keys #-}
 
 toListBy :: (ByteString -> a -> b) -> Trie a -> [b]
 toListBy fn = foldrWithKey (\ k v bs -> fn k v : bs) []
 {-# INLINE toListBy #-}
 
--- | add a common prefix to all existing keys in a Trie. This may be
--- used to model mounting into a directory structure, for example.
+-- | O(1). Add a common prefix to all keys currently in the Trie
 addPrefix :: (VCacheable a) => ByteString -> Trie a -> Trie a
 addPrefix _ t@(Trie Nothing _) = t
-addPrefix p (Trie (Just pRoot) vc) =
+addPrefix prefix (Trie (Just pRoot) vc) =
     let root = deref' pRoot in
-    let p' = p `B.append` (trie_prefix root) in
+    let p' = prefix `B.append` (trie_prefix root) in
     let root' = root { trie_prefix = p' } in
-    let pRoot' = vref vc root' in
-    Trie (Just $! pRoot') vc
+    Trie (Just $! vref vc root') vc
 
--- should probably have some variations to:
---   extract a whole sub-trie by prefix
---   delete a whole sub-trie by prefix
+-- | Lookup an object by key without caching nodes
+lookup' :: ByteString -> Trie a -> Maybe a
+lookup' k = _lookup deref' k . trie_root
+
+-- | Lookup an object by key
+lookup :: ByteString -> Trie a -> Maybe a
+lookup = lookupc CacheMode1
+
+-- | Lookup object by key with a specific cache mode.
+lookupc :: CacheMode -> ByteString -> Trie a -> Maybe a
+lookupc cm k = _lookup (derefc cm) k . trie_root
+
+_lookup :: (VRef (Node a) -> Node a) -> ByteString -> Child a -> Maybe a
+_lookup _ _ Nothing = Nothing
+_lookup d key (Just c) =
+    let tn = d c in
+    let pre = trie_prefix tn in
+    let s = sharedPrefixLen key pre in
+    let k = B.length key in
+    let p = B.length pre in
+    if (s < p) then Nothing else -- couldn't match full prefix
+    assert ((s == p) && (k >= p)) $ 
+    if (k == p) then trie_accept tn else -- match prefix exactly
+    let key' = B.drop (p+1) key in
+    let c' = (trie_branch tn) A.! (B.index key p) in
+    _lookup d key' c'
+    
+-- | Obtain a trie rooted at a given prefix.
+--
+-- This operation may need to allocate a new node.
+lookupPrefix :: (VCacheable a) => ByteString -> Trie a -> Trie a
+lookupPrefix k tr =
+    let child = _lookupP k (trie_root tr) in
+    Trie child (trie_space tr)
+
+_lookupP :: (VCacheable a) => ByteString -> Child a -> Child a
+_lookupP key c | B.null key = c -- stop on exact node
+_lookupP _ Nothing = Nothing -- 
+_lookupP key (Just c) = 
+    let tn = deref' c in
+    let pre = trie_prefix tn in
+    let s = sharedPrefixLen key pre in
+    let k = B.length key in
+    let p = B.length pre in
+    if (k <= p) -- test whether key should fit within prefix
+       then if (s < k) then Nothing else
+            assert (s == k) $
+            let pre' = B.drop k pre in -- trim key from prefix
+            let tn' = tn { trie_prefix = pre' } in
+            Just $! vref (vref_space c) tn' -- allocate new node
+       else if (s < p) then Nothing else 
+            assert (s == p) $
+            let key' = B.drop (p+1) key in
+            let c' = (trie_branch tn) A.! (B.index key p) in
+            _lookupP key' c' -- recursive lookup
+
+
+
+-- More variations: 
+--  extract or delete a trie by prefix.
 
 
 foldrWithKey, foldrWithKey' :: (ByteString -> a -> b -> b) -> b -> Trie a -> b
 foldlWithKey, foldlWithKey' :: (b -> ByteString -> a -> b) -> b -> Trie a -> b
-foldrWithKey fn b0  = _foldrWithKey  fn b0 . trie_root
-foldrWithKey' fn b0 = _foldrWithKey' fn b0 . trie_root
-foldlWithKey fn b0  = _foldlWithKey  fn b0 . trie_root
-foldlWithKey' fn b0 = _foldlWithKey' fn b0 . trie_root
-{-# INLINE foldrWithKey #-}
+{-# INLINE foldrWithKey  #-}
 {-# INLINE foldrWithKey' #-}
-{-# INLINE foldlWithKey #-}
+{-# INLINE foldlWithKey  #-}
 {-# INLINE foldlWithKey' #-}
+foldrWithKey  fn b t = runIdent  $ foldrWithKeyM (apwf fn) b t
+foldrWithKey' fn b t = runStrict $ foldrWithKeyM (apwf fn) b t
+foldlWithKey  fn b t = runIdent  $ foldlWithKeyM (apwf fn) b t
+foldlWithKey' fn b t = runStrict $ foldlWithKeyM (apwf fn) b t
+
+apwf :: (Applicative f) => (a -> b -> c -> d) -> (a -> b -> c -> f d)
+apwf fn a b c = pure (fn a b c)
+{-# INLINE apwf #-}
 
 foldr, foldr' :: (a -> b -> b) -> b -> Trie a -> b
 foldl, foldl' :: (b -> a -> b) -> b -> Trie a -> b
-foldr  = foldrWithKey  . const
-foldr' = foldrWithKey' . const
-foldl  = foldlWithKey  . const
-foldl' = foldlWithKey' . const
-{-# INLINE foldr #-}
+foldrM :: Monad m => (a -> b -> m b) -> b -> Trie a -> m b
+foldlM :: Monad m => (b -> a -> m b) -> b -> Trie a -> m b
+{-# INLINE foldr  #-}
 {-# INLINE foldr' #-}
-{-# INLINE foldl #-}
+{-# INLINE foldrM #-}
+{-# INLINE foldl  #-}
 {-# INLINE foldl' #-}
+{-# INLINE foldlM #-}
+foldr  = foldrWithKey  . skip1st
+foldr' = foldrWithKey' . skip1st
+foldrM = foldrWithKeyM . skip1st
+foldl  = foldlWithKey  . skip2nd
+foldl' = foldlWithKey' . skip2nd
+foldlM = foldlWithKeyM . skip2nd
+
+skip1st :: (b -> c) -> (a -> b -> c)
+skip2nd :: (a -> c) -> (a -> b -> c)
+{-# INLINE skip1st #-}
+{-# INLINE skip2nd #-}
+skip1st = const
+skip2nd = flip . const
+
+foldrWithKeyM :: (Monad m) => (ByteString -> a -> b -> m b) -> b -> Trie a -> m b
+foldrWithKeyM ff = wr where
+    wr b = wc mempty b . trie_root
+    wc _ b Nothing = return b
+    wc p b (Just c) =
+        let tn = deref' c in
+        let p' = nodePrefix p tn in -- extended prefix
+        wlc p' (trie_branch tn) 255 b >>=
+        maybe return (ff (toKey p')) (trie_accept tn)
+    wlc p a !k b = 
+        let cc = if (0 == k) then return else wlc p a (k-1) in
+        let p' = p `mappend` BB.word8 k in -- branch prefix
+        wc p' b (a A.! k) >>= cc
+{-# NOINLINE foldrWithKeyM #-}
+
+foldlWithKeyM :: (Monad m) => (b -> ByteString -> a -> m b) -> b -> Trie a -> m b
+foldlWithKeyM ff = wr where
+    wr b = wc mempty b . trie_root
+    wc _ b Nothing = return b
+    wc p b (Just c) =
+        let tn = deref' c in
+        let p' = nodePrefix p tn in -- extended prefix
+        let cc = wlc p' (trie_branch tn) 0 in
+        case trie_accept tn of
+            Nothing -> cc b
+            Just val -> ff b (toKey p') val >>= cc
+    wlc p a !k b =
+        let cc = if (255 == k) then return else wlc p a (k+1) in
+        let p' = p `mappend` BB.word8 k in -- branch prefix
+        wc p' b (a A.! k) >>= cc
+{-# NOINLINE foldlWithKeyM #-}
 
 
-_foldrWithKey, _foldrWithKey' :: (ByteString -> a -> b -> b) -> b -> Child a -> b
-_foldlWithKey, _foldlWithKey' :: (b -> ByteString -> a -> b) -> b -> Child a -> b
 
+toKey :: BB.Builder -> ByteString
+toKey = LB.toStrict . BB.toLazyByteString      
 
-
-fold
-
+nodePrefix ::  BB.Builder -> Node a -> BB.Builder
+nodePrefix k tn = 
+    let p = trie_prefix tn in
+    if B.null p then k else k `mappend` BB.byteString p 
 
 
 
