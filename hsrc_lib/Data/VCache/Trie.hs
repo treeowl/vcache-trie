@@ -5,30 +5,30 @@ module Data.VCache.Trie
     , trie_space
     , empty, singleton
     , null, size
-    , addPrefix
     , lookup, lookup', lookupc
-    , lookupPrefix
+    , prefixKeys, lookupPrefix, deletePrefix
+    , insert, delete, adjust
+    , insertList, deleteList
 
     , toList, toListBy, elems, keys
     , foldr, foldr', foldrM, foldrWithKey, foldrWithKey', foldrWithKeyM
     , foldl, foldl', foldlM, foldlWithKey, foldlWithKey', foldlWithKeyM
 
-    -- , map, mapM, mapWithKey, mapWithKeyM 
+    , map, mapM, mapWithKey, mapWithKeyM 
 
+    , validate
     ) where
 
-import Prelude hiding (null, lookup, foldr, foldl)
+import Prelude hiding (null, lookup, foldr, foldl, map, mapM)
 import Control.Applicative hiding (empty)
-import Control.Monad
+import qualified Control.Monad as M
 import Control.Exception (assert)
-import Data.Bits
 import Data.Word
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as LB
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Internal as BSI
-import Data.Typeable
 import qualified Data.Array.IArray as A
 import qualified Data.List as L
 import Data.Maybe
@@ -40,76 +40,24 @@ import Foreign.Storable
 
 import Strict
 import Ident
+import Data.VCache.Trie.Type
 
 import Database.VCache
-
--- Thoughts:
---
--- I think we shouldn't encode too much information into any one
--- node, so I'm aiming for:
---
---   encode at most one extended prefix per node
---   encode at most one value per node
---   encode at most 256 references to child nodes
--- 
--- The high branching factor allows for a relatively sparse trie.
--- But it's simple and in many cases should help avoid deep search
--- or update (which is more expensive in VCache than in memory).
---
--- This encoding doesn't make the invariants of a trie especially
--- easy to reason about. Fortunately, tries are relatively easy to
--- reason about even with a simplistic encoding.
---
-
-data Node a = Node
-    { trie_branch :: {-# UNPACK #-} !(Children a) -- arity 256; one byte from prefix
-    , trie_prefix :: {-# UNPACK #-} !ByteString   -- compact extended prefix
-    , trie_accept :: !(Maybe a)                   -- value at specific node
-    } deriving (Eq, Typeable)
--- Invariant for nodes: either we branch or we accept.
-
-type Children a = A.Array Word8 (Child a)
-type Child a = Maybe (VRef (Node a))
-
--- | The Trie data structure. 
---
--- The element type for the trie will be stored directly within each
--- node. So, if it's very large and shouldn't be parsed during lookup,
--- developers should use a VRefs in the data type. For small data, it
--- is likely better for performance to pack the data into each node.
--- 
--- A trie with content is serialized as a pointer to the root node.
---
-data Trie a = Trie 
-    { trie_root  :: !(Child a)
-    , trie_space :: !VSpace
-    } deriving (Eq, Typeable) 
-
-instance (VCacheable a) => VCacheable (Node a) where
-    get = Node <$> getChildren <*> get <*> get
-    put (Node c p v) = putChildren c >> put p >> put v
-instance (VCacheable a) => VCacheable (Trie a) where
-    get = Trie <$> get <*> getVSpace
-    put = put . trie_root
-
-instance (Show a) => Show (Trie a) where
-    showsPrec p t = showParen (p > 0) $
-        showString "Data.VCache.Trie.fromList " .
-        shows (toList t)
 
 -- | Construct Trie with no elements.
 empty :: VSpace -> Trie a
 empty = Trie Nothing
 {-# INLINE empty #-}
 
-emptyChildren :: Children a
-emptyChildren = A.accumArray const Nothing (minBound, maxBound) [] 
-
 -- | Construct Trie with one element.
-singleton :: (VCacheable a) => VSpace -> a -> Trie a
-singleton vc a = Trie (Just pRoot) vc where
-    pRoot = vref vc node
-    node = Node emptyChildren B.empty (Just a)
+singleton :: (VCacheable a) => VSpace -> ByteString -> a -> Trie a
+singleton vc k a = Trie (Just $! vref vc (singletonNode k a)) vc
+
+singletonNode :: ByteString -> a -> Node a
+singletonNode k a = Node (mkChildren []) k (Just a)
+
+mkChildren :: [(Word8, Child a)] -> Children a
+mkChildren = A.accumArray (flip const) Nothing (minBound, maxBound)
 
 -- | O(1), test whether trie is empty.
 null :: Trie a -> Bool
@@ -141,9 +89,9 @@ toListBy fn = foldrWithKey (\ k v bs -> fn k v : bs) []
 {-# INLINE toListBy #-}
 
 -- | O(1). Add a common prefix to all keys currently in the Trie
-addPrefix :: (VCacheable a) => ByteString -> Trie a -> Trie a
-addPrefix _ t@(Trie Nothing _) = t
-addPrefix prefix (Trie (Just pRoot) vc) =
+prefixKeys :: (VCacheable a) => ByteString -> Trie a -> Trie a
+prefixKeys _ t@(Trie Nothing _) = t
+prefixKeys prefix (Trie (Just pRoot) vc) =
     let root = deref' pRoot in
     let p' = prefix `B.append` (trie_prefix root) in
     let root' = root { trie_prefix = p' } in
@@ -205,10 +153,169 @@ _lookupP key (Just c) =
             let c' = (trie_branch tn) A.! (B.index key p) in
             _lookupP key' c' -- recursive lookup
 
+-- | Delete all keys sharing a given prefix. 
+deletePrefix :: (VCacheable a) => ByteString -> Trie a -> Trie a
+deletePrefix p (Trie c vc) = Trie c' vc where
+    c' = _deleteP p c
+
+_deleteP :: (VCacheable a) => ByteString -> Child a -> Child a 
+_deleteP _ Nothing = Nothing
+_deleteP key c@(Just pNode) = 
+    let vc = vref_space pNode in
+    let tn = deref' pNode in
+    let pre = trie_prefix tn in
+    let s = sharedPrefixLen key pre in
+    let k = B.length key in
+    let p = B.length pre in
+    if (k <= p)
+       then if (s < k) then c else -- no elements share prefix
+            assert (s == k) $ Nothing -- all elements share prefix
+       else if (s < p) then c else -- no elements share prefix
+            assert (s == p) $
+            let key' = B.drop (p+1) key in
+            let idx  = B.index key p in
+            let tgt  = (trie_branch tn) A.! idx in
+            let tgt' = _deleteP key' tgt in
+            if (tgt == tgt') then c else -- no change; short-circuit
+            let bDel = isJust tgt && isNothing tgt' in
+            let branch' = trie_branch tn A.// [(idx, tgt')] in
+            let tn' = tn { trie_branch = branch' } in
+            collapseIf vc bDel tn'
+
+-- | Insert a single key,value pair into the trie, replacing any 
+-- existing value at that location.
+insert :: (VCacheable a) => ByteString -> a -> Trie a -> Trie a
+insert k a = adjust (const (Just a)) k
+{-# INLINE insert #-}
+
+-- | Insert a list of (key,value) pairs into the trie. At the moment
+-- this is just a linear insert, but it may later be replaced by an
+-- efficient batch-insert model. If a key appears more than once in
+-- this list, the last entry will win.
+insertList :: (VCacheable a) => [(ByteString, a)] -> Trie a -> Trie a
+insertList = flip $ L.foldl' ins where
+    ins t (k,v) = insert k v t
+{-# INLINE insertList #-}
+
+-- | Remove a single key from the trie.
+delete :: (VCacheable a) => ByteString -> Trie a -> Trie a
+delete k = adjust (const Nothing) k
+{-# INLINE delete #-}
+
+-- | Remove a collection of keys from the trie. At the moment this is
+-- just a sequential deletion, but it may later be replaced by a more
+-- efficient batch-deletion model.
+deleteList :: (VCacheable a) => [ByteString] -> Trie a -> Trie a 
+deleteList = flip (L.foldl' (flip delete))
+{-# INLINE deleteList #-}
+
+-- | Update an element in the Trie with a given function. 
+-- Capable of inserts, modifies, and deletes.
+adjust :: (VCacheable a) => (Maybe a -> Maybe a) -> ByteString -> Trie a -> Trie a
+adjust fn k t = runStrict $ adjustM fn' k t where
+    fn' a = return (fn a)
+{-# INLINE adjust #-}
+
+-- | Adjust using an arbitrary action.
+adjustM :: (VCacheable a, Monad m) => (Maybe a -> m (Maybe a)) -> ByteString -> Trie a -> m (Trie a)
+adjustM fn k0 tr = adjustRoot where
+    vc = trie_space tr
+    adjustRoot = 
+        wc k0 (trie_root tr) >>= \ c' ->
+        return (Trie c' vc)
+    wc key Nothing = fn Nothing >>= \ r -> case r of
+        Nothing -> return Nothing
+        Just a -> 
+            let tn' = singletonNode key a in
+            let c' = Just $! vref vc tn' in
+            return $! c'
+    wc key c@(Just pChild) =
+        let tn = deref' pChild in
+        let pre = trie_prefix tn in
+        let s = sharedPrefixLen key pre in
+        let p = B.length pre in
+        let k = B.length key in
+        if (s < p) -- need to split existing prefix in trie
+           then fn Nothing >>= \ r -> 
+                if isNothing r then return c else -- no change
+                let ixP = B.index pre s in
+                let tnP = tn { trie_prefix = B.drop (s+1) pre } in 
+                let cP  = Just $! vref vc tnP in
+                if (s == k)
+                   then -- split prefix inline
+                        let br' = mkChildren [(ixP, cP)] in
+                        let tn' = Node br' key r in
+                        let c' = Just $! vref vc tn' in
+                        return $! c'
+                   else -- branch middle of prefix
+                        let ixK = B.index key s in
+                        assert ((s < k) && (ixK /= ixP)) $
+                        let brK = mkChildren [] in
+                        let tnK = Node brK (B.drop (s+1) key) r in
+                        let cK = Just $! vref vc tnK in
+                        let br' = mkChildren [(ixK,cK), (ixP, cP)] in
+                        let tn' = Node br' (B.take s pre) Nothing in
+                        let c' = Just $! vref vc tn' in
+                        return $! c'
+           else if (s < k)
+                   then -- adjust recursively
+                        let key' = B.drop (s+1) key in
+                        let ixK  = B.index key s in
+                        let cK = (trie_branch tn) A.! ixK in
+                        wc key' cK >>= \ cK' ->
+                        if (cK == cK') then return c else -- no change!
+                        let bDel = isJust cK && isNothing cK' in
+                        let br' = trie_branch tn A.// [(ixK, cK')] in
+                        let tn' = tn { trie_branch = br' } in
+                        return $! collapseIf vc bDel tn'
+                   else assert (s == k) $ -- adjust this node
+                        let v = trie_accept tn in
+                        fn v >>= \ v' ->
+                        let bDel = isJust v && isNothing v' in
+                        let tn' = tn { trie_accept = v' } in
+                        return $! collapseIf vc bDel tn'
+
+-- utility, tryCollapse only if some deletion condition is true
+collapseIf :: (VCacheable a) => VSpace -> Bool -> Node a -> Child a
+collapseIf vc bDel tn =
+    if not bDel then Just $! vref vc tn else
+    case tryCollapse tn of
+        Nothing -> Nothing
+        Just tn' -> Just $! vref vc tn'
+
+-- tryCollapse will reconstruct a node after a deletion to preserve
+-- invariant structure (i.e. that every node accepts or branches).
+tryCollapse :: Node a -> Maybe (Node a)
+tryCollapse tn =
+    if isJust (trie_accept tn) then Just tn else -- 
+    let lChildren = L.filter (isJust . snd) (A.assocs (trie_branch tn)) in
+    case lChildren of
+        [] -> Nothing -- full collapse 
+        (_:_:_) -> Just tn -- we branch, so invariant is preserved
+        [(ix, Just c)] -> -- need to collapse nodes linearly
+            let tnC = deref' c in -- note: assuming tnC is valid
+            let key' = toKey $ BB.byteString (trie_prefix tn)
+                            <> BB.word8 ix
+                            <> BB.byteString (trie_prefix tnC)
+            in
+            let tn' = tnC { trie_prefix = key' } in
+            Just tn'
+        _ -> impossible "could not collapse node"
 
 
--- More variations: 
---  extract or delete a trie by prefix.
+
+-- | Validate the invariant structure of the Trie. 
+-- Every node must branch or contain a value.
+validate :: Trie a -> Bool
+validate = maybe True validRef . trie_root where
+    validRef = validNode . deref'
+    validNode tn = 
+        let lChildren = catMaybes (A.elems (trie_branch tn)) in
+        let bBranch = case lChildren of { (_:_:_) -> True; _ -> False } in
+        let bAccept = isJust (trie_accept tn) in
+        let bNodeValid = bAccept || bBranch in
+        bNodeValid && L.all validRef lChildren
+
 
 
 foldrWithKey, foldrWithKey' :: (ByteString -> a -> b -> b) -> b -> Trie a -> b
@@ -283,6 +390,43 @@ foldlWithKeyM ff = wr where
 {-# NOINLINE foldlWithKeyM #-}
 
 
+map :: (VCacheable b) => (a -> b) -> Trie a -> Trie b
+map = mapWithKey . skip1st
+{-# INLINE map #-}
+
+mapM :: (VCacheable b, Monad m) => (a -> m b) -> Trie a -> m (Trie b)
+mapM = mapWithKeyM . skip1st
+{-# INLINE mapM #-}
+
+mapWithKey :: (VCacheable b) => (ByteString -> a -> b) -> Trie a -> Trie b
+mapWithKey fn = runStrict . mapWithKeyM fn' where
+    fn' a b = pure (fn a b)
+{-# INLINE mapWithKey #-}
+
+mapWithKeyM :: (Monad m, VCacheable b) => (ByteString -> a -> m b) -> Trie a -> m (Trie b)
+mapWithKeyM ff = wr where
+    wr (Trie c vc) = 
+        wc mempty c >>= \ c' ->
+        return (Trie c' vc)
+    wc _ Nothing = return Nothing
+    wc p (Just c) =
+        let tn = deref' c in
+        let p' = nodePrefix p tn in -- extended prefix
+        mbrun (ff (toKey p')) (trie_accept tn) >>= \ accept' ->
+        let lcs = A.assocs (trie_branch tn) in
+        M.mapM (wlc p') lcs >>= \ lcs' ->
+        let branch' = A.array (minBound, maxBound) lcs' in
+        let tn' = Node branch' (trie_prefix tn) accept' in
+        let c' = vref' (vref_space c) tn' in
+        return $! (Just $! c')
+    wlc p (ix, child) =
+        let p' = p <> BB.word8 ix in
+        wc p' child >>= \ child' ->
+        return (ix, child')
+
+mbrun :: (Monad m) => (a -> m b) -> Maybe a -> m (Maybe b)
+mbrun _ Nothing = return Nothing
+mbrun action (Just a) = M.liftM Just (action a)
 
 toKey :: BB.Builder -> ByteString
 toKey = LB.toStrict . BB.toLazyByteString      
@@ -290,80 +434,8 @@ toKey = LB.toStrict . BB.toLazyByteString
 nodePrefix ::  BB.Builder -> Node a -> BB.Builder
 nodePrefix k tn = 
     let p = trie_prefix tn in
-    if B.null p then k else k `mappend` BB.byteString p 
-
-
-
-
-
-
-{-
-unionWith :: (a ->
-filterWithKey :: (ByteString -> a -> Bool) -> Trie a -> Trie a
-
-
-map :: (VCacheable b) => (a -> b) -> Trie a -> Trie b
-mapWithKey :: (VCacheable b) => (ByteString -> a -> b) -> Trie a -> Trie b
-
-
-
-filterMap :: (VCacheable b) =
--}
-
-
-
-
-getChildren :: (VCacheable a) => VGet (Children a)
-getChildren = A.listArray (minBound, maxBound) <$> getChild256
-
--- obtain a list of exactly 256 elements
-getChild256 :: (VCacheable a) => VGet [Child a]
-getChild256 = L.concat <$> replicateM 32 getChild8
-
--- obtain a list of exactly 8 elements
-getChild8 :: (VCacheable a) => VGet [Child a]
-getChild8 = do
-    f <- getWord8
-    let rc n = if (0 == (f .&. (1 `shiftL` n))) 
-                then return Nothing -- no child indicated 
-                else Just <$> get -- pointer to child trie
-    c0 <- rc 0
-    c1 <- rc 1
-    c2 <- rc 2
-    c3 <- rc 3
-    c4 <- rc 4
-    c5 <- rc 5
-    c6 <- rc 6
-    c7 <- rc 7
-    return [c0,c1,c2,c3
-           ,c4,c5,c6,c7]
-
-putChildren :: (VCacheable a) => Children a -> VPut ()
-putChildren = putChildList . A.elems
-
-putChildList :: (VCacheable a) => [Child a] -> VPut ()
-putChildList lc = mapM_ put (bitFlags lc) >> mapM_ put (catMaybes lc)
-
-bitFlags :: [Maybe a] -> [Word8]
-bitFlags [] = []
-bitFlags (c0:c1:c2:c3:c4:c5:c6:c7:cs) = f : bitFlags cs where
-    f = (b c0 0) .|. 
-        (b c1 1) .|.
-        (b c2 2) .|.
-        (b c3 3) .|.
-        (b c4 4) .|.
-        (b c5 5) .|.
-        (b c6 6) .|.
-        (b c7 7)
-    b Nothing _ = 0
-    b (Just _) n = 1 `shiftL` n
-bitFlags _ = impossible "expecting multiple of 8 children"
-
-impossible :: String -> a
-impossible emsg = error $ "Data.VCache.Trie: " ++ emsg 
-
-
-
+    if B.null p then k else 
+    k <> BB.byteString p 
 
 
 -- | Return byte count for prefix common among two strings.
