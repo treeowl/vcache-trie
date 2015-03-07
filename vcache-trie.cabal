@@ -46,8 +46,8 @@ Library
     Strict
     Ident
     Data.VCache.Trie.Type
-    Data.VCache.Trie.Mem
-    Data.VCache.Trie.MemType
+    -- Data.VCache.Trie.Mem
+    -- Data.VCache.Trie.MemType
    
   ghc-options: -Wall -auto-all
 

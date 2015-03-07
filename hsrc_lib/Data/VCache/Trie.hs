@@ -17,6 +17,7 @@ module Data.VCache.Trie
     , map, mapM, mapWithKey, mapWithKeyM 
 
     , validate
+    , unsafeTrieAddr
     ) where
 
 import Prelude hiding (null, lookup, foldr, foldl, map, mapM)
@@ -287,11 +288,10 @@ collapseIf vc bDel tn =
 -- invariant structure (i.e. that every node accepts or branches).
 tryCollapse :: Node a -> Maybe (Node a)
 tryCollapse tn =
-    if isJust (trie_accept tn) then Just tn else -- 
+    if isJust (trie_accept tn) then Just tn else -- node accepts
     let lChildren = L.filter (isJust . snd) (A.assocs (trie_branch tn)) in
     case lChildren of
         [] -> Nothing -- full collapse 
-        (_:_:_) -> Just tn -- we branch, so invariant is preserved
         [(ix, Just c)] -> -- need to collapse nodes linearly
             let tnC = deref' c in -- note: assuming tnC is valid
             let key' = toKey $ BB.byteString (trie_prefix tn)
@@ -300,8 +300,13 @@ tryCollapse tn =
             in
             let tn' = tnC { trie_prefix = key' } in
             Just tn'
-        _ -> impossible "could not collapse node"
+        _ -> Just tn -- node branches
 
+
+-- TODO:
+--
+-- efficient bulk insert and deletion
+-- efficient structural diff of tries
 
 
 -- | Validate the invariant structure of the Trie. 
@@ -315,8 +320,6 @@ validate = maybe True validRef . trie_root where
         let bAccept = isJust (trie_accept tn) in
         let bNodeValid = bAccept || bBranch in
         bNodeValid && L.all validRef lChildren
-
-
 
 foldrWithKey, foldrWithKey' :: (ByteString -> a -> b -> b) -> b -> Trie a -> b
 foldlWithKey, foldlWithKey' :: (b -> ByteString -> a -> b) -> b -> Trie a -> b
@@ -437,7 +440,6 @@ nodePrefix k tn =
     if B.null p then k else 
     k <> BB.byteString p 
 
-
 -- | Return byte count for prefix common among two strings.
 sharedPrefixLen :: ByteString -> ByteString -> Int
 sharedPrefixLen (BSI.PS s1 off1 len1) (BSI.PS s2 off2 len2) =
@@ -458,3 +460,5 @@ indexOfDiff !p1 !p2 !len = loop 0 where
 -- an aide for type inference
 peekByte :: Ptr Word8 -> IO Word8
 peekByte = peek 
+
+
