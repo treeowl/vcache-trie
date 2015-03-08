@@ -43,20 +43,12 @@ type Children a = A.Array Word8 (Child a)
 type Child a = Maybe (VRef (Node a))
 
 
--- | A trie data structure with bytesting keys, above VCache.
---
--- This trie uses a simple node structure, with a large branching
--- factor (arity 256), and serializing large shared prefixes and the
--- element values into the same node. The root of the trie is simply 
--- a `Maybe (VRef node)`, so is efficient for equality comparisons and
--- serialization purposes. The basic 'Show' instance reports only the
--- root reference address.
---
--- The trie supports keys of arbitrary size, though very large keys may
--- cause some performance degradation. Similarly, very large values may
--- cause performance degradation since every lookup will load every value
--- in the path. 
---
+-- | A trie data structure with bytestring keys, above VCache.
+-- 
+-- A trie supports keys of arbitrary size, though very large keys may
+-- cause performance degradation. Values are directly serialized into
+-- nodes, so very large values should use indirection.
+-- 
 data Trie a = Trie 
     { trie_root  :: !(Child a)
     , trie_space :: !VSpace
