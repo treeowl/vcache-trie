@@ -1,5 +1,5 @@
 Name: vcache-trie
-Version: 0.1
+Version: 0.1.1
 Synopsis: patricia tries modeled above VCache 
 Category: Database
 Description:
@@ -39,12 +39,12 @@ Library
 
   Exposed-Modules:
     Data.VCache.Trie
+    Data.VCache.Trie.Type
 
   Other-Modules:
 
     Strict
     Ident
-    Data.VCache.Trie.Type
     -- Data.VCache.Trie.Mem
     -- Data.VCache.Trie.MemType
    

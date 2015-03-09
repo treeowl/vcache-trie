@@ -1,6 +1,12 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 
 -- | The underlying structure for a Trie. 
+--
+-- This is an internal module, but is exposed for now because I'm not
+-- sure how to best generically target features such as structural 
+-- diffs. And we might eventually benefit from zippers, etc. After 
+-- experimenting and learning, I ask you to push the best generic 
+-- code into the vcache-trie package (i.e. send a pull request).
 module Data.VCache.Trie.Type
     ( Trie(..)
     , Node(..)
@@ -32,6 +38,9 @@ import Database.VCache
 -- larger values. 
 --
 
+
+-- | A node should either accept a value or branch into at least two
+-- children. 
 data Node a = Node
     { trie_branch :: {-# UNPACK #-} !(Children a) -- arity 256; one byte from prefix
     , trie_prefix :: {-# UNPACK #-} !ByteString   -- compact extended prefix
