@@ -68,7 +68,7 @@ instance (VCacheable a) => VCacheable (Node a) where
     put (Node c p v) = putChildren c >> put p >> put v
 instance (VCacheable a) => VCacheable (Trie a) where
     get = Trie <$> get <*> getVSpace
-    put = put . trie_root
+    put (Trie r vc) = put r >> put vc
 instance Show (Trie a) where
     showsPrec _ t = showString "Trie#" . shows (unsafeTrieAddr t)
 

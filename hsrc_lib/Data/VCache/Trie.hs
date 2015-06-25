@@ -7,6 +7,7 @@ module Data.VCache.Trie
     , null, size
     , lookup, lookup', lookupc
     , prefixKeys, lookupPrefix, deletePrefix
+    , lookupPrefixNode
     , insert, delete, adjust
     , insertList, deleteList
 
@@ -127,14 +128,25 @@ _lookup d key (Just c) =
     
 -- | Obtain a trie rooted at a given prefix.
 --
--- This operation may need to allocate a new node.
+-- This operation may need to allocate in VCache, e.g. to delete
+-- some fraction of the requested prefix. This isn't optimal for
+-- performance.
 lookupPrefix :: (VCacheable a) => ByteString -> Trie a -> Trie a
 lookupPrefix k tr =
-    let child = _lookupP k (trie_root tr) in
-    Trie child (trie_space tr)
+    let node = lookupPrefixNode k tr in
+    let vc = trie_space tr in
+    let child = vref vc <$> node in
+    Trie child vc
 
-_lookupP :: (VCacheable a) => ByteString -> Child a -> Child a
-_lookupP key c | B.null key = c -- stop on exact node
+-- | Obtain a trie node rooted at a given prefix, if any content
+-- exists at this prefix. This operation allows some performance 
+-- benefits compared to 'lookupPrefix' because it never allocates
+-- at the VCache layer. 
+lookupPrefixNode :: (VCacheable a) => ByteString -> Trie a -> Maybe (Node a)
+lookupPrefixNode k = _lookupP k . trie_root
+
+_lookupP :: (VCacheable a) => ByteString -> Child a -> Maybe (Node a)
+_lookupP key c | B.null key = deref' <$> c -- stop on exact node
 _lookupP _ Nothing = Nothing -- 
 _lookupP key (Just c) = 
     let tn = deref' c in
@@ -147,7 +159,7 @@ _lookupP key (Just c) =
             assert (s == k) $
             let pre' = B.drop k pre in -- trim key from prefix
             let tn' = tn { trie_prefix = pre' } in
-            Just $! vref (vref_space c) tn' -- allocate new node
+            Just $! tn' -- allocate new node
        else if (s < p) then Nothing else 
             assert (s == p) $
             let key' = B.drop (p+1) key in
