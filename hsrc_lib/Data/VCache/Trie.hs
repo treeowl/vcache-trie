@@ -5,9 +5,11 @@ module Data.VCache.Trie
     , trie_space
     , empty, singleton
     , null, size
-    , lookup, lookup', lookupc
-    , prefixKeys, lookupPrefix, deletePrefix
-    , lookupPrefixNode
+    , lookup, lookup'
+    , prefixKeys
+    , lookupPrefix, lookupPrefix'
+    , lookupPrefixNode, lookupPrefixNode' 
+    , deletePrefix
     , insert, delete, adjust
     , insertList, deleteList
 
@@ -19,6 +21,7 @@ module Data.VCache.Trie
 
     , validate
     , unsafeTrieAddr
+    , DerefNode
     ) where
 
 import Prelude hiding (null, lookup, foldr, foldl, map, mapM)
@@ -45,6 +48,14 @@ import Ident
 import Data.VCache.Trie.Type
 
 import Database.VCache
+
+-- | function to dereference a Trie cache node.
+-- This improves user control over caching on lookup.
+type DerefNode a = VRef (Node a) -> Node a
+
+-- default dereference for lookups
+defaultDeref :: DerefNode a
+defaultDeref = derefc CacheMode0
 
 -- | Construct Trie with no elements.
 empty :: VSpace -> Trie a
@@ -99,19 +110,15 @@ prefixKeys prefix (Trie (Just pRoot) vc) =
     let root' = root { trie_prefix = p' } in
     Trie (Just $! vref vc root') vc
 
--- | Lookup an object by key without caching nodes
-lookup' :: ByteString -> Trie a -> Maybe a
-lookup' k = _lookup deref' k . trie_root
+-- | Lookup an object by key with user-provided deref.
+lookup' :: DerefNode a -> ByteString -> Trie a -> Maybe a
+lookup' d k = _lookup d k . trie_root
 
 -- | Lookup an object by key
 lookup :: ByteString -> Trie a -> Maybe a
-lookup = lookupc CacheMode1
+lookup = lookup' defaultDeref
 
--- | Lookup object by key with a specific cache mode.
-lookupc :: CacheMode -> ByteString -> Trie a -> Maybe a
-lookupc cm k = _lookup (derefc cm) k . trie_root
-
-_lookup :: (VRef (Node a) -> Node a) -> ByteString -> Child a -> Maybe a
+_lookup :: DerefNode a -> ByteString -> Child a -> Maybe a
 _lookup _ _ Nothing = Nothing
 _lookup d key (Just c) =
     let tn = d c in
@@ -125,15 +132,19 @@ _lookup d key (Just c) =
     let key' = B.drop (p+1) key in
     let c' = (trie_branch tn) A.! (B.index key p) in
     _lookup d key' c'
-    
+
 -- | Obtain a trie rooted at a given prefix.
 --
 -- This operation may need to allocate in VCache, e.g. to delete
 -- some fraction of the requested prefix. This isn't optimal for
 -- performance.
 lookupPrefix :: (VCacheable a) => ByteString -> Trie a -> Trie a
-lookupPrefix k tr =
-    let node = lookupPrefixNode k tr in
+lookupPrefix = lookupPrefix' defaultDeref 
+
+-- | lookup prefix with user-provided deref function.
+lookupPrefix' :: (VCacheable a) => DerefNode a -> ByteString -> Trie a -> Trie a
+lookupPrefix' d k tr = 
+    let node = lookupPrefixNode' d k tr in
     let vc = trie_space tr in
     let child = vref vc <$> node in
     Trie child vc
@@ -143,13 +154,17 @@ lookupPrefix k tr =
 -- benefits compared to 'lookupPrefix' because it never allocates
 -- at the VCache layer. 
 lookupPrefixNode :: (VCacheable a) => ByteString -> Trie a -> Maybe (Node a)
-lookupPrefixNode k = _lookupP k . trie_root
+lookupPrefixNode = lookupPrefixNode' defaultDeref
 
-_lookupP :: (VCacheable a) => ByteString -> Child a -> Maybe (Node a)
-_lookupP key c | B.null key = deref' <$> c -- stop on exact node
-_lookupP _ Nothing = Nothing -- 
-_lookupP key (Just c) = 
-    let tn = deref' c in
+-- | lookup prefix node with user-provided deref function
+lookupPrefixNode' :: (VCacheable a) => DerefNode a -> ByteString -> Trie a -> Maybe (Node a)
+lookupPrefixNode' d k = _lookupP d k . trie_root
+
+_lookupP :: (VCacheable a) => DerefNode a -> ByteString -> Child a -> Maybe (Node a)
+_lookupP d key c | B.null key = d <$> c -- stop on exact node
+_lookupP _ _ Nothing = Nothing -- 
+_lookupP d key (Just c) = 
+    let tn = d c in
     let pre = trie_prefix tn in
     let s = sharedPrefixLen key pre in
     let k = B.length key in
@@ -164,18 +179,21 @@ _lookupP key (Just c) =
             assert (s == p) $
             let key' = B.drop (p+1) key in
             let c' = (trie_branch tn) A.! (B.index key p) in
-            _lookupP key' c' -- recursive lookup
+            _lookupP d key' c' -- recursive lookup
 
 -- | Delete all keys sharing a given prefix. 
 deletePrefix :: (VCacheable a) => ByteString -> Trie a -> Trie a
-deletePrefix p (Trie c vc) = Trie c' vc where
-    c' = _deleteP p c
+deletePrefix = deletePrefix' deref'
 
-_deleteP :: (VCacheable a) => ByteString -> Child a -> Child a 
-_deleteP _ Nothing = Nothing
-_deleteP key c@(Just pNode) = 
+-- | Delete keys using user-defined lookup.
+deletePrefix' :: VCacheable a => DerefNode a -> ByteString -> Trie a -> Trie a
+deletePrefix' d p (Trie c vc) = Trie (_deleteP d p c) vc
+
+_deleteP :: (VCacheable a) => DerefNode a -> ByteString -> Child a -> Child a 
+_deleteP _ _ Nothing = Nothing
+_deleteP d key c@(Just pNode) = 
     let vc = vref_space pNode in
-    let tn = deref' pNode in
+    let tn = d pNode in
     let pre = trie_prefix tn in
     let s = sharedPrefixLen key pre in
     let k = B.length key in
@@ -188,7 +206,7 @@ _deleteP key c@(Just pNode) =
             let key' = B.drop (p+1) key in
             let idx  = B.index key p in
             let tgt  = (trie_branch tn) A.! idx in
-            let tgt' = _deleteP key' tgt in
+            let tgt' = _deleteP d key' tgt in
             if (tgt == tgt') then c else -- no change; short-circuit
             let bDel = isJust tgt && isNothing tgt' in
             let branch' = trie_branch tn A.// [(idx, tgt')] in
