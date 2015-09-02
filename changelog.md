@@ -15,3 +15,7 @@
 * modified lookup' to receive user-defined 'deref' behavior
  * removes lookupc and modifies signature for lookup'
 * lookup variants now use CacheMode0 by default
+
+## 0.2.1
+* performance: plain old bytestring ops for key reconstruction 
+ * (from profiling) bytestring builder isn't helping at typical key sizes

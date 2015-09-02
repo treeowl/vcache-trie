@@ -31,8 +31,6 @@ import Control.Exception (assert)
 import Data.Word
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
-import qualified Data.ByteString.Lazy as LB
-import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.Array.IArray as A
 import qualified Data.List as L
@@ -324,10 +322,7 @@ tryCollapse tn =
         [] -> Nothing -- full collapse 
         [(ix, Just c)] -> -- need to collapse nodes linearly
             let tnC = deref' c in -- note: assuming tnC is valid
-            let key' = toKey $ BB.byteString (trie_prefix tn)
-                            <> BB.word8 ix
-                            <> BB.byteString (trie_prefix tnC)
-            in
+            let key' = mconcat [trie_prefix tn, B.singleton ix, trie_prefix tnC] in
             let tn' = tnC { trie_prefix = key' } in
             Just tn'
         _ -> Just tn -- node branches
@@ -337,6 +332,7 @@ tryCollapse tn =
 --
 -- efficient bulk insert and deletion
 -- efficient structural diff of tries
+-- ranged key or element searches
 
 
 -- | Validate the invariant structure of the Trie. 
@@ -396,12 +392,12 @@ foldrWithKeyM ff = wr where
     wc _ b Nothing = return b
     wc p b (Just c) =
         let tn = deref' c in
-        let p' = nodePrefix p tn in -- extended prefix
+        let p' = p <> trie_prefix tn in
         wlc p' (trie_branch tn) 255 b >>=
-        maybe return (ff (toKey p')) (trie_accept tn)
+        maybe return (ff p') (trie_accept tn)
     wlc p a !k b = 
         let cc = if (0 == k) then return else wlc p a (k-1) in
-        let p' = p `mappend` BB.word8 k in -- branch prefix
+        let p' = p `B.snoc` k in -- branch prefix
         wc p' b (a A.! k) >>= cc
 {-# NOINLINE foldrWithKeyM #-}
 
@@ -411,14 +407,14 @@ foldlWithKeyM ff = wr where
     wc _ b Nothing = return b
     wc p b (Just c) =
         let tn = deref' c in
-        let p' = nodePrefix p tn in -- extended prefix
+        let p' = p <> trie_prefix tn in -- extended prefix
         let cc = wlc p' (trie_branch tn) 0 in
         case trie_accept tn of
             Nothing -> cc b
-            Just val -> ff b (toKey p') val >>= cc
+            Just val -> ff b p' val >>= cc
     wlc p a !k b =
         let cc = if (255 == k) then return else wlc p a (k+1) in
-        let p' = p `mappend` BB.word8 k in -- branch prefix
+        let p' = p `B.snoc` k in -- branch prefix
         wc p' b (a A.! k) >>= cc
 {-# NOINLINE foldlWithKeyM #-}
 
@@ -444,8 +440,8 @@ mapWithKeyM ff = wr where
     wc _ Nothing = return Nothing
     wc p (Just c) =
         let tn = deref' c in
-        let p' = nodePrefix p tn in -- extended prefix
-        mbrun (ff (toKey p')) (trie_accept tn) >>= \ accept' ->
+        let p' = p <> trie_prefix tn in -- extended prefix
+        mbrun (ff p') (trie_accept tn) >>= \ accept' ->
         let lcs = A.assocs (trie_branch tn) in
         M.mapM (wlc p') lcs >>= \ lcs' ->
         let branch' = A.array (minBound, maxBound) lcs' in
@@ -453,22 +449,13 @@ mapWithKeyM ff = wr where
         let c' = vref' (vref_space c) tn' in
         return $! (Just $! c')
     wlc p (ix, child) =
-        let p' = p <> BB.word8 ix in
+        let p' = p `B.snoc` ix in
         wc p' child >>= \ child' ->
         return (ix, child')
 
 mbrun :: (Monad m) => (a -> m b) -> Maybe a -> m (Maybe b)
 mbrun _ Nothing = return Nothing
 mbrun action (Just a) = M.liftM Just (action a)
-
-toKey :: BB.Builder -> ByteString
-toKey = LB.toStrict . BB.toLazyByteString      
-
-nodePrefix ::  BB.Builder -> Node a -> BB.Builder
-nodePrefix k tn = 
-    let p = trie_prefix tn in
-    if B.null p then k else 
-    k <> BB.byteString p 
 
 -- | Return byte count for prefix common among two strings.
 sharedPrefixLen :: ByteString -> ByteString -> Int
