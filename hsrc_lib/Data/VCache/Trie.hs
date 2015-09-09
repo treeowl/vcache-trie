@@ -19,27 +19,24 @@ module Data.VCache.Trie
 
     , map, mapM, mapWithKey, mapWithKeyM 
 
+    , toListOnKey
+
     , validate
     , unsafeTrieAddr
     , DerefNode
     ) where
 
-import Prelude hiding (null, lookup, foldr, foldl, map, mapM)
+import Prelude hiding (null, lookup, foldr, foldl, map, mapM, elem)
 import Control.Applicative hiding (empty)
 import qualified Control.Monad as M
 import Control.Exception (assert)
 import Data.Word
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
-import qualified Data.ByteString.Internal as BSI
 import qualified Data.Array.IArray as A
 import qualified Data.List as L
 import Data.Maybe
 import Data.Monoid
-
-import Foreign.ForeignPtr
-import Foreign.Ptr
-import Foreign.Storable
 
 import Strict
 import Ident
@@ -419,6 +416,67 @@ foldlWithKeyM ff = wr where
 {-# NOINLINE foldlWithKeyM #-}
 
 
+-- | Quickly find keys to the left or right of a given key. If the given
+-- key is matched, it appears at the head of the right list. The left list
+-- is reverse-ordered, finding keys to the left of the requested key.
+--
+-- The intention here is to support efficient ranged searches or lookups.
+-- The lists returned are computed lazily.
+toListOnKey :: ByteString -> Trie a -> ([(ByteString, a)], [(ByteString, a)])
+toListOnKey fullKey = nodeOnKey 0 . trie_root where
+    nodeOnKey _ Nothing = ([],[])
+    nodeOnKey nKeyBytes (Just c) = 
+        let tn = deref' c in
+        let key = B.drop nKeyBytes fullKey in
+        let pre = trie_prefix tn in
+        let s = sharedPrefixLen key pre in
+        let pathToNode = B.take nKeyBytes fullKey in
+        let nodeToLeftOfKey = (nodeL pathToNode tn, []) in
+        let nodeToRightOfKey = ([], nodeR pathToNode tn) in
+        -- if key is fully matched, then node is fully to right.
+        if (s == B.length key) then nodeToRightOfKey else
+        assert (s < B.length key) $
+        let ck = B.index key s in
+        -- if we've matched the whole prefix, but not the whole key,
+        -- we can split the node.
+        if (s == B.length pre) then nodeSplitOnKey (nKeyBytes + s) ck tn else
+        assert (s < B.length pre) $
+        -- otherwise, key is fully to left or right of current node.
+        let cp = B.index pre s in
+        if (cp > ck) then nodeToRightOfKey else 
+        assert (cp < ck) $ nodeToLeftOfKey
+
+    nodeElem p = maybe [] (return . (,) p) . trie_accept
+
+    -- entire node is to left of key; fast path
+    nodeL pathToNode tn =
+        let p = pathToNode <> trie_prefix tn in
+        let onC (i, c) = maybe [] (nodeL (p `B.snoc` i) . deref') c in
+        let children = fmap onC $ A.assocs (trie_branch tn) in
+        let elem = nodeElem p tn in
+        mconcat $ L.reverse (elem:children) -- largest key at head
+
+    -- entire node is to right of key; fast path
+    nodeR pathToNode tn =
+        let p = pathToNode <> trie_prefix tn in
+        let onChild (i,c) = maybe [] (nodeR (p `B.snoc` i) . deref') c in
+        let children = fmap onChild $ A.assocs (trie_branch tn) in
+        let elem = nodeElem p tn in
+        mconcat (elem:children) -- i.e. smallest key at head
+
+    -- key splits node in twain, some to left and/or some to right
+    nodeSplitOnKey nKeyBytes keyChar tn =
+        let p = B.take nKeyBytes fullKey in
+        let elem = nodeElem p tn in
+        let onCL (i,c) = maybe [] (nodeL (p `B.snoc` i) . deref') c in
+        let onCR (i,c) = maybe [] (nodeR (p `B.snoc` i) . deref') c in
+        let cL = fmap onCL $ L.filter ((< keyChar) . fst) $ A.assocs (trie_branch tn) in
+        let cR = fmap onCR $ L.filter ((> keyChar) . fst) $ A.assocs (trie_branch tn) in
+        let eL = mconcat $ L.reverse (elem:cL) in -- element is leftmost from key
+        let eR = mconcat cR in
+        let (keL,keR) = nodeOnKey (nKeyBytes + 1) (trie_branch tn A.! keyChar) in
+        (keL ++ eL, keR ++ eR)
+
 map :: (VCacheable b) => (a -> b) -> Trie a -> Trie b
 map = mapWithKey . skip1st
 {-# INLINE map #-}
@@ -456,26 +514,5 @@ mapWithKeyM ff = wr where
 mbrun :: (Monad m) => (a -> m b) -> Maybe a -> m (Maybe b)
 mbrun _ Nothing = return Nothing
 mbrun action (Just a) = M.liftM Just (action a)
-
--- | Return byte count for prefix common among two strings.
-sharedPrefixLen :: ByteString -> ByteString -> Int
-sharedPrefixLen (BSI.PS s1 off1 len1) (BSI.PS s2 off2 len2) =
-    BSI.inlinePerformIO $ 
-    withForeignPtr s1 $ \ p1 ->
-    withForeignPtr s2 $ \ p2 ->
-    indexOfDiff (p1 `plusPtr` off1) (p2 `plusPtr` off2) (min len1 len2)
-
-indexOfDiff :: Ptr Word8 -> Ptr Word8 -> Int -> IO Int
-indexOfDiff !p1 !p2 !len = loop 0 where
-    loop !idx = 
-        if (idx == len) then return len else
-        peekByte (p1 `plusPtr` idx) >>= \ c1 ->
-        peekByte (p2 `plusPtr` idx) >>= \ c2 ->
-        if (c1 /= c2) then return idx else
-        loop (idx + 1)
-
--- an aide for type inference
-peekByte :: Ptr Word8 -> IO Word8
-peekByte = peek 
 
 
