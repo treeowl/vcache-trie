@@ -23,3 +23,5 @@
 ## 0.2.2
 * function: toListOnKey to support key-range lookups
 
+## 0.2.3
+* function: diff; find changes between two tries

@@ -20,6 +20,7 @@ module Data.VCache.Trie
     , map, mapM, mapWithKey, mapWithKeyM 
 
     , toListOnKey
+    , diff, Diff(..)
 
     , validate
     , unsafeTrieAddr
@@ -390,10 +391,10 @@ foldrWithKeyM ff = wr where
     wc p b (Just c) =
         let tn = deref' c in
         let p' = p <> trie_prefix tn in
-        wlc p' (trie_branch tn) 255 b >>=
+        wlc p' (trie_branch tn) maxBound b >>=
         maybe return (ff p') (trie_accept tn)
     wlc p a !k b = 
-        let cc = if (0 == k) then return else wlc p a (k-1) in
+        let cc = if (minBound == k) then return else wlc p a (k-1) in
         let p' = p `B.snoc` k in -- branch prefix
         wc p' b (a A.! k) >>= cc
 {-# NOINLINE foldrWithKeyM #-}
@@ -405,12 +406,12 @@ foldlWithKeyM ff = wr where
     wc p b (Just c) =
         let tn = deref' c in
         let p' = p <> trie_prefix tn in -- extended prefix
-        let cc = wlc p' (trie_branch tn) 0 in
+        let cc = wlc p' (trie_branch tn) minBound in
         case trie_accept tn of
             Nothing -> cc b
             Just val -> ff b p' val >>= cc
     wlc p a !k b =
-        let cc = if (255 == k) then return else wlc p a (k+1) in
+        let cc = if (maxBound == k) then return else wlc p a (k+1) in
         let p' = p `B.snoc` k in -- branch prefix
         wc p' b (a A.! k) >>= cc
 {-# NOINLINE foldlWithKeyM #-}
@@ -476,6 +477,113 @@ toListOnKey fullKey = nodeOnKey 0 . trie_root where
         let eR = mconcat cR in
         let (keL,keR) = nodeOnKey (nKeyBytes + 1) (trie_branch tn A.! keyChar) in
         (keL ++ eL, keR ++ eR)
+
+-- | a simple difference data structure. We're either 
+-- just in the left, just in the right, or have some
+-- simple difference in both (e.g. based on Eq).
+data Diff a = InL a | Diff a a | InR a
+    deriving (Show, Eq)
+
+-- thoughts: it might be worthwhile to have a variation
+-- that preserves common subtrees and elements, i.e. such
+-- that both trees can be reconstructed from the diff.
+
+-- | Compute differences between two tries. The provided functions 
+-- determine the difference type for values in just the left or right
+-- or both. 
+diff :: (Eq a) => Trie a -> Trie a -> [(ByteString, Diff a)]
+diff = diffRoot where
+    diffRoot a b = diffChild mempty (trie_root a) (trie_root b)
+
+    diffChild _ Nothing Nothing = mempty
+    diffChild k (Just a) Nothing = subtree k InL (deref' a)
+    diffChild k Nothing (Just b) = subtree k InR (deref' b)
+    diffChild k (Just a) (Just b) = 
+        if (a == b) then mempty else 
+        diffNode k (deref' a) (deref' b)
+
+    diffNode k tnA tnB =
+        let kA = trie_prefix tnA in
+        let kB = trie_prefix tnB in
+        let s = sharedPrefixLen kA kB in
+        if (s == B.length kA) 
+            then if (s == B.length kB) 
+                then diffNodeEQ k tnA tnB
+                else diffNodeAB k tnA tnB
+            else if (s == B.length kB)
+                then diffNodeBA k tnA tnB
+                else let elemsA = subtree k InL tnA in
+                     let elemsB = subtree k InR tnB in
+                     let ca = B.index (trie_prefix tnA) s in
+                     let cb = B.index (trie_prefix tnB) s in
+                     -- nodes are for adjacent, non-overlapping subtrees
+                     assert (ca /= cb) $
+                     if (ca < cb) then elemsA <> elemsB
+                                  else elemsB <> elemsA
+
+    diffNodeAB k tnA tnB = -- A is strict prefix of B, higher in tree
+        assert (trie_prefix tnA `isStrictPrefixOf` trie_prefix tnB) $
+        let s = B.length (trie_prefix tnA) in
+        let c = B.index (trie_prefix tnB) s in
+        let (diffLeft, diffRight) = splitTree k InL c tnA in
+        let diffMiddle = case trie_branch tnA A.! c of
+                Nothing -> subtree k InR tnB
+                Just childSplit ->  
+                    let keySplit = k <> B.take (s + 1) (trie_prefix tnB) in
+                    let tnB' = tnB { trie_prefix = B.drop (s + 1) (trie_prefix tnB) } in
+                    diffNode keySplit (deref' childSplit) tnB'
+        in
+        mconcat [diffLeft, diffMiddle, diffRight]
+
+    diffNodeBA k tnA tnB = -- B is strict prefix of A, higher in tree
+        assert (trie_prefix tnB `isStrictPrefixOf` trie_prefix tnA) $
+        let s = B.length (trie_prefix tnB) in
+        let c = B.index (trie_prefix tnA) s in
+        let (diffLeft, diffRight) = splitTree k InR c tnB in
+        let diffMiddle = case trie_branch tnB A.! c of
+                Nothing -> subtree k InL tnA
+                Just childSplit ->
+                    let keySplit = k <> B.take (s + 1) (trie_prefix tnA) in
+                    let tnA' = tnA { trie_prefix = B.drop (s + 1) (trie_prefix tnA) } in
+                    diffNode keySplit tnA' (deref' childSplit)
+        in
+        mconcat [diffLeft, diffMiddle, diffRight]
+
+    diffNodeEQ k tnA tnB = -- nodes match on key including trie_prefix 
+        assert (trie_prefix tnA == trie_prefix tnB) $
+        let fullKey = k <> trie_prefix tnA in
+        let diffK = case (trie_accept tnA, trie_accept tnB) of
+                (Just va, Nothing) -> [(fullKey, InL va)]
+                (Nothing, Just vb) -> [(fullKey, InR vb)]
+                (Just va, Just vb) | (va /= vb) -> [(fullKey, Diff va vb)]
+                _ -> [] -- no difference
+        in
+        let diffC (i, cA) = diffChild (fullKey `B.snoc` i) cA (trie_branch tnB A.! i) in
+        let diffChildren = L.concatMap diffC (A.assocs (trie_branch tnA)) in
+        diffK <> diffChildren
+
+    -- common case where a whole subtree is different
+    subtree k fn tn = -- list every element in trie, in left or right
+        let fullKey = k <> trie_prefix tn in
+        let lK = maybeToList $ fmap ((,) fullKey . fn) (trie_accept tn) in
+        let onC (i,c) = maybe [] (subtree (fullKey `B.snoc` i) fn . deref') c in
+        let lC = mconcat $ fmap onC $ A.assocs (trie_branch tn) in
+        lK <> lC
+
+    splitTree k fn c tn = -- split a subtree around a key
+        let fullKey = k <> trie_prefix tn in
+        let elemK = maybeToList $ fmap ((,) fullKey . fn) $ trie_accept tn in
+        let onC i = maybe [] (subtree (fullKey `B.snoc` i) fn . deref') (trie_branch tn A.! i) in
+        let rangeL = if (c == minBound) then [] else enumFromTo minBound (pred c) in
+        let rangeR = if (c == maxBound) then [] else enumFromTo (succ c) maxBound in
+        let leftElems = mconcat $ elemK : fmap onC rangeL in
+        let rightElems = mconcat $ fmap onC rangeR in
+        (leftElems, rightElems)
+        
+isStrictPrefixOf :: ByteString -> ByteString -> Bool
+isStrictPrefixOf a b = (B.length a < B.length b) && (a `B.isPrefixOf` b)
+       
+
 
 map :: (VCacheable b) => (a -> b) -> Trie a -> Trie b
 map = mapWithKey . skip1st
