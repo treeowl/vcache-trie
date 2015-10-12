@@ -25,3 +25,6 @@
 
 ## 0.2.3
 * function: diff; find changes between two tries
+
+## 0.2.4
+* added 'functor' instance for the Diff datatype

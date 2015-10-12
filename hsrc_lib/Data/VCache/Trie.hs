@@ -484,6 +484,11 @@ toListOnKey fullKey = nodeOnKey 0 . trie_root where
 data Diff a = InL a | Diff a a | InR a
     deriving (Show, Eq)
 
+instance Functor Diff where
+    fmap f (InL a) = InL (f a)
+    fmap f (Diff a b) = Diff (f a) (f b)
+    fmap f (InR b) = InR (f b)
+
 -- thoughts: it might be worthwhile to have a variation
 -- that preserves common subtrees and elements, i.e. such
 -- that both trees can be reconstructed from the diff.
@@ -491,6 +496,9 @@ data Diff a = InL a | Diff a a | InR a
 -- | Compute differences between two tries. The provided functions 
 -- determine the difference type for values in just the left or right
 -- or both. 
+--
+-- Note: this function is optimized for cases where tries are in the
+-- same VSpace and share many subtrees.
 diff :: (Eq a) => Trie a -> Trie a -> [(ByteString, Diff a)]
 diff = diffRoot where
     diffRoot a b = diffChild mempty (trie_root a) (trie_root b)
